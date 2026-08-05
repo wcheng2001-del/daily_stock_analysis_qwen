@@ -2095,6 +2095,106 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class FreeFinanceNewsProvider(BaseSearchProvider):
+    """
+    Free finance-news search using SearXNG with source-scoped queries.
+
+    This provider keeps the no-key path focused on finance sites before the
+    generic SearXNG fallback. It does not bypass site paywalls.
+    """
+
+    SOURCE_DOMAINS = (
+        "finance.eastmoney.com",
+        "stock.eastmoney.com",
+        "finance.qq.com",
+        "stock.finance.qq.com",
+        "finance.yahoo.com",
+    )
+    SITE_FILTER = (
+        "site:finance.eastmoney.com OR "
+        "site:stock.eastmoney.com OR "
+        "site:finance.qq.com OR "
+        "site:stock.finance.qq.com OR "
+        "site:finance.yahoo.com/news"
+    )
+
+    def __init__(self, delegate: SearXNGSearchProvider):
+        super().__init__(["free-finance-news"], "FreeFinanceNews")
+        self._delegate = delegate
+
+    @property
+    def is_available(self) -> bool:
+        return bool(self._delegate and self._delegate.is_available)
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+    ) -> SearchResponse:
+        return self.search(query, max_results=max_results, days=days)
+
+    @classmethod
+    def _scoped_query(cls, query: str) -> str:
+        return f"({query}) ({cls.SITE_FILTER})"
+
+    @classmethod
+    def _is_allowed_source(cls, item: SearchResult) -> bool:
+        host = urlparse(item.url or "").hostname or ""
+        host = host.lower().lstrip("www.")
+        return any(host == domain or host.endswith(f".{domain}") for domain in cls.SOURCE_DOMAINS)
+
+    @staticmethod
+    def _dedupe_results(results: List[SearchResult], *, max_results: int) -> List[SearchResult]:
+        deduped: List[SearchResult] = []
+        seen_urls: set[str] = set()
+        for item in results:
+            url_key = (item.url or "").strip()
+            if not url_key or url_key in seen_urls:
+                continue
+            seen_urls.add(url_key)
+            deduped.append(item)
+            if len(deduped) >= max_results:
+                break
+        return deduped
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        if not self.is_available:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="免费财经新闻源不可用：SearXNG 未配置或公共实例关闭",
+            )
+
+        response = self._delegate.search(
+            self._scoped_query(query),
+            max_results=max(max_results * 2, max_results),
+            days=days,
+        )
+        if not response.success:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=response.error_message,
+                search_time=response.search_time,
+            )
+
+        filtered = [item for item in response.results if self._is_allowed_source(item)]
+        return SearchResponse(
+            query=query,
+            results=self._dedupe_results(filtered, max_results=max_results),
+            provider=self.name,
+            success=True,
+            error_message=None,
+            search_time=response.search_time,
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2333,6 +2433,10 @@ class SearchService:
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
         )
         if searxng_provider.is_available:
+            self._providers.append(FreeFinanceNewsProvider(searxng_provider))
+            logger.info(
+                "已启用免费财经新闻定向搜索：东方财富、腾讯财经、Yahoo Finance（经 SearXNG）"
+            )
             self._providers.append(searxng_provider)
             if searxng_base_urls:
                 logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))

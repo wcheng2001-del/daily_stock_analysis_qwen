@@ -78,6 +78,14 @@ def test_daily_analysis_maps_all_provider_template_channels() -> None:
     assert not any(key.startswith("LLM_ARK_") for key in env)
 
 
+def test_daily_analysis_exposes_qwen_thinking_controls() -> None:
+    env = _load_daily_analysis_env()
+
+    assert "QWEN_THINKING_ENABLED" in env
+    assert "QWEN_THINKING_BUDGET" in env
+    assert "QWEN_REASONING_EFFORT" in env
+
+
 def test_daily_analysis_keeps_channel_secrets_in_secrets_context() -> None:
     templates = _extract_provider_templates()
     env = _load_daily_analysis_env()

@@ -10,7 +10,7 @@ from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
 
-from src.agent.llm_adapter import LLMToolAdapter
+from src.agent.llm_adapter import LLMToolAdapter, get_thinking_extra_body
 from src.agent.litellm_route_resolution import resolve_agent_litellm_route
 from src.llm.backend_registry import LOCAL_CLI_GENERATION_BACKEND_IDS
 
@@ -50,6 +50,26 @@ def _remote_deployment(model_name: str):
             "api_key": "sk-remote",
         },
     }
+
+
+def test_qwen_thinking_extra_body_uses_env_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QWEN_THINKING_ENABLED", "true")
+    monkeypatch.setenv("QWEN_THINKING_BUDGET", "500")
+    monkeypatch.setenv("QWEN_REASONING_EFFORT", "xhigh")
+
+    assert get_thinking_extra_body("qwen-plus") == {
+        "enable_thinking": True,
+        "thinking_budget": 500,
+        "reasoning_effort": "xhigh",
+    }
+
+
+def test_qwen_thinking_extra_body_can_disable_thinking(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QWEN_THINKING_ENABLED", "false")
+    monkeypatch.delenv("QWEN_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("QWEN_REASONING_EFFORT", raising=False)
+
+    assert get_thinking_extra_body("qwen3.7-flash") == {"enable_thinking": False}
 
 
 def test_agent_resolver_rejects_hermes_only_route() -> None:

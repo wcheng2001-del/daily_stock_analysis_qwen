@@ -8,6 +8,7 @@ interface consumed by the AgentExecutor, via LiteLLM.
 
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -101,6 +102,11 @@ _AUTO_THINKING_MODELS: List[str] = ["deepseek-reasoner", "deepseek-r1", "qwq"]
 _OPT_IN_THINKING_MODELS: Dict[str, dict] = {
     "deepseek-chat": {"thinking": {"type": "enabled"}},
 }
+
+_QWEN_THINKING_MODEL_PREFIXES: List[str] = [
+    "qwen",
+]
+_QWEN_REASONING_EFFORT_VALUES = {"low", "medium", "high", "xhigh", "max"}
 
 # Custom model pricing for models not in LiteLLM's built-in price list.
 # Official MiniMax pricing: https://platform.minimax.io/docs/guides/pricing-paygo
@@ -280,6 +286,50 @@ def _get_opt_in_payload(model: str, opt_in: Dict[str, dict]) -> Optional[dict]:
     return None
 
 
+def _parse_env_bool(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    return normalized not in {"0", "false", "no", "off", "disabled", "disable", "none"}
+
+
+def _get_qwen_thinking_extra_body(model: str) -> Optional[dict]:
+    """Return Qwen OpenAI-compatible thinking controls from env vars."""
+    if not _model_matches(model, _QWEN_THINKING_MODEL_PREFIXES):
+        return None
+
+    payload: Dict[str, Any] = {
+        "enable_thinking": _parse_env_bool(os.getenv("QWEN_THINKING_ENABLED"), default=True)
+    }
+
+    budget_raw = (os.getenv("QWEN_THINKING_BUDGET") or "").strip()
+    if budget_raw:
+        try:
+            budget = int(budget_raw)
+        except ValueError:
+            logger.warning("Invalid QWEN_THINKING_BUDGET=%r; ignoring", budget_raw)
+        else:
+            if budget > 0:
+                payload["thinking_budget"] = budget
+            else:
+                logger.warning("QWEN_THINKING_BUDGET=%r must be positive; ignoring", budget_raw)
+
+    effort_raw = (os.getenv("QWEN_REASONING_EFFORT") or "").strip().lower()
+    if effort_raw:
+        if effort_raw in _QWEN_REASONING_EFFORT_VALUES:
+            payload["reasoning_effort"] = effort_raw
+        else:
+            logger.warning(
+                "Invalid QWEN_REASONING_EFFORT=%r; expected one of %s",
+                effort_raw,
+                sorted(_QWEN_REASONING_EFFORT_VALUES),
+            )
+
+    return payload
+
+
 def get_thinking_extra_body(model: str) -> Optional[dict]:
     """Return extra_body for thinking mode, or None.
 
@@ -289,11 +339,13 @@ def get_thinking_extra_body(model: str) -> Optional[dict]:
       Return None to avoid duplicate activation.
     - Opt-in models (_OPT_IN_THINKING_MODELS: deepseek-chat): Return the activation
       payload to explicitly enable thinking mode.
+    - Qwen hybrid thinking models: Return OpenAI-compatible extra_body with
+      enable_thinking plus optional thinking_budget/reasoning_effort.
     - All other models: Return None (no thinking mode).
     """
     if _model_matches(model, _AUTO_THINKING_MODELS):
         return None
-    return _get_opt_in_payload(model, _OPT_IN_THINKING_MODELS)
+    return _get_qwen_thinking_extra_body(model) or _get_opt_in_payload(model, _OPT_IN_THINKING_MODELS)
 
 
 def resolve_fallback_litellm_wire_models(
