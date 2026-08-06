@@ -298,6 +298,7 @@ jobs:
           BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          ASTOCK_DIRECT_NEWS_ENABLED: ${{ vars.ASTOCK_DIRECT_NEWS_ENABLED || secrets.ASTOCK_DIRECT_NEWS_ENABLED || 'true' }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -408,6 +409,8 @@ jobs:
           # ==========================================
           LOG_LEVEL: INFO
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
+          ASTOCK_SIGNAL_DATA_ENABLED: ${{ vars.ASTOCK_SIGNAL_DATA_ENABLED || secrets.ASTOCK_SIGNAL_DATA_ENABLED || 'true' }}
+          EM_MIN_INTERVAL: ${{ vars.EM_MIN_INTERVAL || secrets.EM_MIN_INTERVAL || '1.0' }}
           # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
           ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）

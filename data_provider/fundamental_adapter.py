@@ -9,13 +9,24 @@ endpoint candidates. It should never raise to caller; partial data is allowed.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
+
+_EASTMONEY_DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+_EASTMONEY_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_EASTMONEY_SESSION = requests.Session()
+_EASTMONEY_SESSION.headers.update({"User-Agent": _EASTMONEY_UA})
+_EASTMONEY_LOCK = threading.Lock()
+_EASTMONEY_LAST_CALL = 0.0
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -60,6 +71,81 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(s)
     except (TypeError, ValueError):
         return None
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 无效，已回退为 %.1f", name, raw, default)
+        return default
+
+
+def _eastmoney_get(
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 10,
+) -> requests.Response:
+    """Eastmoney direct HTTP with process-level throttling."""
+    global _EASTMONEY_LAST_CALL
+
+    min_interval = _env_float("EM_MIN_INTERVAL", 1.0)
+    with _EASTMONEY_LOCK:
+        wait = min_interval - (time.time() - _EASTMONEY_LAST_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        response = _EASTMONEY_SESSION.get(
+            url,
+            params=params or {},
+            headers=headers,
+            timeout=timeout,
+        )
+        _EASTMONEY_LAST_CALL = time.time()
+        return response
+
+
+def _eastmoney_datacenter(
+    report_name: str,
+    *,
+    columns: str = "ALL",
+    filter_str: str = "",
+    page_size: int = 50,
+    sort_columns: str = "",
+    sort_types: str = "-1",
+) -> List[Dict[str, Any]]:
+    params = {
+        "reportName": report_name,
+        "columns": columns,
+        "filter": filter_str,
+        "pageNumber": "1",
+        "pageSize": str(page_size),
+        "sortColumns": sort_columns,
+        "sortTypes": sort_types,
+        "source": "WEB",
+        "client": "WEB",
+    }
+    resp = _eastmoney_get(_EASTMONEY_DATACENTER_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("result", {}).get("data")
+    return data if isinstance(data, list) else []
+
+
+def _stock_to_eastmoney_secid(stock_code: str) -> str:
+    code = _normalize_code(stock_code)
+    return f"1.{code}" if code.startswith(("6", "8")) else f"0.{code}"
 
 
 def _safe_str(value: Any) -> str:
@@ -289,6 +375,159 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
+    def _get_capital_flow_eastmoney(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "stock_flow": {},
+            "sector_rankings": {"top": [], "bottom": []},
+            "source_chain": [],
+            "errors": [],
+        }
+        if not _env_bool("ASTOCK_SIGNAL_DATA_ENABLED", True):
+            result["errors"].append("ASTOCK_SIGNAL_DATA_ENABLED=false")
+            return result
+
+        try:
+            secid = _stock_to_eastmoney_secid(stock_code)
+            url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+            params_rt = {
+                "secid": secid,
+                "klt": 1,
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            }
+            resp = _eastmoney_get(url_rt, params=params_rt, timeout=10)
+            resp.raise_for_status()
+            klines = resp.json().get("data", {}).get("klines", []) or []
+            if klines:
+                last = str(klines[-1]).split(",")
+                if len(last) >= 6:
+                    result["stock_flow"] = {
+                        "main_net_inflow": _safe_float(last[1]),
+                        "small_net_inflow": _safe_float(last[2]),
+                        "medium_net_inflow": _safe_float(last[3]),
+                        "large_net_inflow": _safe_float(last[4]),
+                        "super_large_net_inflow": _safe_float(last[5]),
+                        "latest_time": last[0],
+                    }
+                    result["source_chain"].append("capital_stock:eastmoney_push2")
+        except Exception as exc:
+            result["errors"].append(f"eastmoney_stock_flow:{type(exc).__name__}")
+
+        try:
+            url_hist = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+            params_hist = {
+                "secid": _stock_to_eastmoney_secid(stock_code),
+                "lmt": 20,
+                "klt": 101,
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            }
+            resp = _eastmoney_get(url_hist, params=params_hist, timeout=10)
+            resp.raise_for_status()
+            klines = resp.json().get("data", {}).get("klines", []) or []
+            if klines:
+                daily = []
+                for line in klines:
+                    parts = str(line).split(",")
+                    if len(parts) >= 6:
+                        daily.append(
+                            {
+                                "date": parts[0],
+                                "main_net_inflow": _safe_float(parts[1]),
+                                "small_net_inflow": _safe_float(parts[2]),
+                                "medium_net_inflow": _safe_float(parts[3]),
+                                "large_net_inflow": _safe_float(parts[4]),
+                                "super_large_net_inflow": _safe_float(parts[5]),
+                            }
+                        )
+                main_values = [
+                    item["main_net_inflow"]
+                    for item in daily
+                    if item.get("main_net_inflow") is not None
+                ]
+                if main_values:
+                    stock_flow = result.setdefault("stock_flow", {})
+                    stock_flow["inflow_5d"] = sum(main_values[-5:])
+                    stock_flow["inflow_10d"] = sum(main_values[-10:])
+                    stock_flow["daily"] = daily[-10:]
+                    result["source_chain"].append("capital_history:eastmoney_push2his")
+        except Exception as exc:
+            result["errors"].append(f"eastmoney_stock_flow_history:{type(exc).__name__}")
+
+        try:
+            url_sector = "https://push2.eastmoney.com/api/qt/clist/get"
+            params_sector = {
+                "pn": "1",
+                "pz": "80",
+                "po": "1",
+                "np": "1",
+                "fltt": "2",
+                "invt": "2",
+                "fs": "m:90+t:2",
+                "fields": "f3,f12,f14,f62",
+            }
+            resp = _eastmoney_get(url_sector, params=params_sector, timeout=10)
+            resp.raise_for_status()
+            items = resp.json().get("data", {}).get("diff", []) or []
+            parsed = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                parsed.append(
+                    {
+                        "name": _safe_str(item.get("f14")),
+                        "change_pct": _safe_float(item.get("f3")),
+                        "net_inflow": _safe_float(item.get("f62")),
+                    }
+                )
+            parsed = [item for item in parsed if item.get("name") and item.get("net_inflow") is not None]
+            if parsed:
+                ranked = sorted(parsed, key=lambda item: float(item.get("net_inflow") or 0), reverse=True)
+                result["sector_rankings"] = {
+                    "top": ranked[:top_n],
+                    "bottom": list(reversed(ranked[-top_n:])),
+                }
+                result["source_chain"].append("capital_sector:eastmoney_push2")
+        except Exception as exc:
+            result["errors"].append(f"eastmoney_sector_flow:{type(exc).__name__}")
+
+        return result
+
+    def _get_dragon_tiger_eastmoney(self, stock_code: str, lookback_days: int = 20) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "is_on_list": False,
+            "recent_count": 0,
+            "latest_date": None,
+            "source_chain": [],
+            "errors": [],
+        }
+        if not _env_bool("ASTOCK_SIGNAL_DATA_ENABLED", True):
+            result["errors"].append("ASTOCK_SIGNAL_DATA_ENABLED=false")
+            return result
+
+        try:
+            end_dt = datetime.now()
+            start_dt = end_dt - timedelta(days=max(1, lookback_days))
+            data = _eastmoney_datacenter(
+                "RPT_DAILYBILLBOARD_DETAILSNEW",
+                filter_str=(
+                    f"(TRADE_DATE>='{start_dt:%Y-%m-%d}')"
+                    f"(TRADE_DATE<='{end_dt:%Y-%m-%d}')"
+                    f"(SECURITY_CODE=\"{_normalize_code(stock_code)}\")"
+                ),
+                page_size=50,
+                sort_columns="TRADE_DATE",
+                sort_types="-1",
+            )
+            result["recent_count"] = len(data)
+            result["is_on_list"] = bool(data)
+            result["latest_date"] = str(data[0].get("TRADE_DATE", ""))[:10] if data else None
+            result["source_chain"].append("dragon_tiger:eastmoney_datacenter")
+        except Exception as exc:
+            result["errors"].append(f"eastmoney_dragon_tiger:{type(exc).__name__}")
+
+        return result
+
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
@@ -466,6 +705,23 @@ class AkshareFundamentalAdapter:
                 }
                 result["source_chain"].append(f"capital_sector:{sector_source}")
 
+        direct_flow = self._get_capital_flow_eastmoney(stock_code, top_n=top_n)
+        result["errors"].extend(direct_flow.get("errors", []))
+        direct_stock_flow = direct_flow.get("stock_flow") or {}
+        if isinstance(direct_stock_flow, dict):
+            stock_flow = result.setdefault("stock_flow", {})
+            for key, value in direct_stock_flow.items():
+                if stock_flow.get(key) is None:
+                    stock_flow[key] = value
+        direct_sector_rankings = direct_flow.get("sector_rankings") or {}
+        if isinstance(direct_sector_rankings, dict):
+            sector_rankings = result.setdefault("sector_rankings", {"top": [], "bottom": []})
+            if not sector_rankings.get("top") and direct_sector_rankings.get("top"):
+                sector_rankings["top"] = direct_sector_rankings.get("top")
+            if not sector_rankings.get("bottom") and direct_sector_rankings.get("bottom"):
+                sector_rankings["bottom"] = direct_sector_rankings.get("bottom")
+        result["source_chain"].extend(direct_flow.get("source_chain", []))
+
         has_content = bool(result["stock_flow"] or result["sector_rankings"]["top"] or result["sector_rankings"]["bottom"])
         result["status"] = "partial" if has_content else "not_supported"
         return result
@@ -490,6 +746,14 @@ class AkshareFundamentalAdapter:
         ])
         result["errors"].extend(errors)
         if df is None:
+            direct_result = self._get_dragon_tiger_eastmoney(stock_code, lookback_days=lookback_days)
+            result["errors"].extend(direct_result.get("errors", []))
+            result["source_chain"].extend(direct_result.get("source_chain", []))
+            if direct_result.get("is_on_list") or direct_result.get("recent_count"):
+                result["is_on_list"] = bool(direct_result.get("is_on_list"))
+                result["recent_count"] = int(direct_result.get("recent_count") or 0)
+                result["latest_date"] = direct_result.get("latest_date")
+                result["status"] = "ok"
             return result
 
         # Try code filter
@@ -508,6 +772,14 @@ class AkshareFundamentalAdapter:
         if matched.empty:
             result["source_chain"].append(f"dragon_tiger:{source}")
             result["status"] = "ok" if code_cols else "partial"
+            direct_result = self._get_dragon_tiger_eastmoney(stock_code, lookback_days=lookback_days)
+            result["errors"].extend(direct_result.get("errors", []))
+            result["source_chain"].extend(direct_result.get("source_chain", []))
+            if direct_result.get("is_on_list") or direct_result.get("recent_count"):
+                result["is_on_list"] = bool(direct_result.get("is_on_list"))
+                result["recent_count"] = int(direct_result.get("recent_count") or 0)
+                result["latest_date"] = direct_result.get("latest_date")
+                result["status"] = "ok"
             return result
 
         date_col = next((c for c in matched.columns if any(k in str(c) for k in ("日期", "上榜", "交易日", "time"))), None)

@@ -11,10 +11,14 @@ A股自选股智能分析系统 - 搜索服务模块
 4. 搜索结果缓存和格式化
 """
 
+import html
+import json
 import logging
+import os
 import re
 import threading
 import time
+import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -2095,6 +2099,309 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class DirectFinanceNewsProvider(BaseSearchProvider):
+    """
+    Direct no-key finance news provider.
+
+    This provider uses public finance-site endpoints directly before falling
+    back to search engines. Endpoints are unofficial, so every source is
+    fail-open and rate-limited.
+    """
+
+    EASTMONEY_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
+    EASTMONEY_FAST_NEWS_URL = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
+    CLS_NEWS_URL = "https://www.cls.cn/nodeapi/telegraphList"
+    YAHOO_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+
+    _em_lock = threading.Lock()
+    _em_last_call = 0.0
+    _session = requests.Session()
+    _session.headers.update({"User-Agent": USER_AGENT})
+
+    def __init__(self):
+        super().__init__(["direct-finance-news"], "DirectFinanceNews")
+        self._enabled = os.getenv("ASTOCK_DIRECT_NEWS_ENABLED", "true").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        self._em_min_interval = self._parse_float_env("EM_MIN_INTERVAL", 1.0)
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+    ) -> SearchResponse:
+        return self.search(query, max_results=max_results, days=days)
+
+    @staticmethod
+    def _parse_float_env(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or not str(raw).strip():
+            return default
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning("%s=%r 无效，已回退为 %.1f", name, raw, default)
+            return default
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        text = html.unescape(str(value or ""))
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _extract_stock_code(query: str) -> Optional[str]:
+        match = re.search(r"\b(?:SH|SZ|BJ)?([0368]\d{5})\b", query.upper())
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_us_symbol(query: str) -> Optional[str]:
+        for token in re.findall(r"\b[A-Z]{1,5}(?:\.[A-Z])?\b", query.upper()):
+            if token in {"STOCK", "NEWS", "LATEST", "SH", "SZ", "BJ"}:
+                continue
+            if not token.isdigit():
+                return token
+        return None
+
+    @classmethod
+    def _dedupe_results(cls, results: List[SearchResult], max_results: int) -> List[SearchResult]:
+        deduped: List[SearchResult] = []
+        seen: set[str] = set()
+        for item in results:
+            key = (item.url or item.title or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= max_results:
+                break
+        return deduped
+
+    def _em_get(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: int = 10,
+    ) -> requests.Response:
+        with self._em_lock:
+            wait = self._em_min_interval - (time.time() - self.__class__._em_last_call)
+            if wait > 0:
+                time.sleep(wait)
+            response = self._session.get(url, params=params or {}, headers=headers, timeout=timeout)
+            self.__class__._em_last_call = time.time()
+            return response
+
+    def _fetch_eastmoney_stock_news(self, keyword: str, max_results: int) -> List[SearchResult]:
+        inner_param = {
+            "uid": "",
+            "keyword": keyword,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": 1,
+                    "pageSize": max(max_results, 10),
+                    "preTag": "",
+                    "postTag": "",
+                }
+            },
+        }
+        params = {"cb": "callback", "param": json.dumps(inner_param, ensure_ascii=False), "_": "1"}
+        headers = {"Referer": "https://so.eastmoney.com/", "User-Agent": self.USER_AGENT}
+        resp = self._em_get(self.EASTMONEY_SEARCH_URL, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        text = resp.text.strip()
+        if "(" not in text or ")" not in text:
+            return []
+        payload = json.loads(text[text.index("(") + 1 : text.rindex(")")])
+
+        results: List[SearchResult] = []
+        for item in payload.get("result", {}).get("cmsArticleWebOld", []) or []:
+            title = self._clean_text(item.get("title"))
+            if not title:
+                continue
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=self._clean_text(item.get("content"))[:500],
+                    url=str(item.get("url") or ""),
+                    source=item.get("mediaName") or "东方财富",
+                    published_date=str(item.get("date") or "")[:10] or None,
+                )
+            )
+        return results
+
+    def _fetch_sina_stock_news(self, code: str, max_results: int) -> List[SearchResult]:
+        prefix = "sh" if code.startswith(("6", "8")) else "sz"
+        url = f"https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllNewsStock.php?symbol={prefix}{code}&Page=1"
+        headers = {"User-Agent": self.USER_AGENT, "Referer": "https://finance.sina.com.cn/"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        resp.encoding = "gb2312"
+
+        results: List[SearchResult] = []
+        rows = re.findall(
+            r"(\d{4}-\d{2}-\d{2})\s*(?:&nbsp;)*(\d{2}:\d{2})\s*(?:&nbsp;)*"
+            r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>([^<]+)</a>",
+            resp.text,
+        )
+        for date_str, time_str, link, title in rows[:max_results]:
+            results.append(
+                SearchResult(
+                    title=self._clean_text(title),
+                    snippet="",
+                    url=link,
+                    source="新浪财经",
+                    published_date=f"{date_str} {time_str}",
+                )
+            )
+        return results
+
+    def _fetch_global_fast_news(self, max_results: int) -> List[SearchResult]:
+        results: List[SearchResult] = []
+
+        try:
+            headers = {"User-Agent": self.USER_AGENT, "Referer": "https://www.cls.cn/"}
+            resp = requests.get(self.CLS_NEWS_URL, params={"rn": str(max_results), "page": "1"}, headers=headers, timeout=8)
+            resp.raise_for_status()
+            payload = resp.json()
+            for item in payload.get("data", {}).get("roll_data", []) or []:
+                published = None
+                ctime = item.get("ctime")
+                if ctime:
+                    try:
+                        published = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
+                    except (TypeError, ValueError, OSError):
+                        published = str(ctime)
+                title = self._clean_text(item.get("title") or item.get("brief"))
+                if title:
+                    results.append(
+                        SearchResult(
+                            title=title,
+                            snippet=self._clean_text(item.get("content") or item.get("brief"))[:500],
+                            url="https://www.cls.cn/telegraph",
+                            source="财联社",
+                            published_date=published,
+                        )
+                    )
+        except Exception as exc:
+            logger.debug("[DirectFinanceNews] 财联社快讯获取失败: %s", exc)
+
+        try:
+            params = {
+                "client": "web",
+                "biz": "web_724",
+                "fastColumn": "102",
+                "sortEnd": "",
+                "pageSize": str(max_results),
+                "req_trace": str(int(time.time() * 1000)),
+            }
+            headers = {"User-Agent": self.USER_AGENT, "Referer": "https://kuaixun.eastmoney.com/"}
+            resp = self._em_get(self.EASTMONEY_FAST_NEWS_URL, params=params, headers=headers, timeout=8)
+            resp.raise_for_status()
+            payload = resp.json()
+            for item in payload.get("data", {}).get("fastNewsList", []) or []:
+                title = self._clean_text(item.get("title"))
+                if title:
+                    results.append(
+                        SearchResult(
+                            title=title,
+                            snippet=self._clean_text(item.get("summary"))[:500],
+                            url=str(item.get("url") or "https://kuaixun.eastmoney.com/"),
+                            source="东方财富7x24",
+                            published_date=item.get("showTime"),
+                        )
+                    )
+        except Exception as exc:
+            logger.debug("[DirectFinanceNews] 东方财富7x24获取失败: %s", exc)
+
+        return results
+
+    def _fetch_yahoo_rss(self, symbol: str, max_results: int) -> List[SearchResult]:
+        params = {"s": symbol, "region": "US", "lang": "en-US"}
+        headers = {"User-Agent": self.USER_AGENT}
+        resp = requests.get(self.YAHOO_RSS_URL, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+
+        results: List[SearchResult] = []
+        for item in root.findall(".//item")[:max_results]:
+            title = self._clean_text(item.findtext("title"))
+            link = str(item.findtext("link") or "")
+            if not title:
+                continue
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=self._clean_text(item.findtext("description"))[:500],
+                    url=link,
+                    source="Yahoo Finance",
+                    published_date=item.findtext("pubDate"),
+                )
+            )
+        return results
+
+    def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
+        start_time = time.time()
+        results: List[SearchResult] = []
+        errors: List[str] = []
+
+        cn_code = self._extract_stock_code(query)
+        if cn_code:
+            for label, fetcher in (
+                ("东方财富个股新闻", lambda: self._fetch_eastmoney_stock_news(cn_code, max_results)),
+                ("新浪财经个股新闻", lambda: self._fetch_sina_stock_news(cn_code, max_results)),
+            ):
+                try:
+                    results.extend(fetcher())
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+                    logger.debug("[DirectFinanceNews] %s 获取失败: %s", label, exc)
+        else:
+            symbol = self._extract_us_symbol(query)
+            if symbol:
+                try:
+                    results.extend(self._fetch_yahoo_rss(symbol, max_results))
+                except Exception as exc:
+                    errors.append(f"Yahoo Finance: {exc}")
+                    logger.debug("[DirectFinanceNews] Yahoo Finance 获取失败: %s", exc)
+
+        if len(results) < max_results:
+            results.extend(self._fetch_global_fast_news(max_results))
+
+        deduped = self._dedupe_results(results, max_results)
+        return SearchResponse(
+            query=query,
+            results=deduped,
+            provider=self.name,
+            success=bool(deduped),
+            error_message=None if deduped else ("；".join(errors[:3]) if errors else "direct finance news returned no results"),
+            search_time=time.time() - start_time,
+        )
+
+
 class FreeFinanceNewsProvider(BaseSearchProvider):
     """
     Free finance-news search using SearXNG with source-scoped queries.
@@ -2427,7 +2734,13 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 6. 免费财经新闻直连（东方财富/新浪/财联社/Yahoo Finance，无 API Key）
+        direct_finance_news_provider = DirectFinanceNewsProvider()
+        if direct_finance_news_provider.is_available:
+            self._providers.append(direct_finance_news_provider)
+            logger.info("已启用免费财经新闻直连：东方财富、新浪财经、财联社、Yahoo Finance")
+
+        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2443,7 +2756,7 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
+        # 8. Anspire Search（实时智能搜索优化）
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
